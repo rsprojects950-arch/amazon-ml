@@ -429,7 +429,7 @@ def main():
     parser.add_argument("--test-dir", default="../../dataset/test", help="Path to test data directory")
     parser.add_argument("--output-dir", default="../../output", help="Path to output directory")
     parser.add_argument("--model-path", default="models/lgb_matcher.joblib", help="Path to save/load trained model")
-    parser.add_argument("--threshold", type=float, default=0.58, help="Fallback probability threshold for matching")
+    parser.add_argument("--threshold", type=float, default=0.95, help="Fallback probability threshold for matching")
     parser.add_argument("--max-cands", type=int, default=80, help="Max candidates per S1 entity")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of parallel worker processes")
     parser.add_argument("--skip-train", action="store_true", help="Skip training if model file exists")
