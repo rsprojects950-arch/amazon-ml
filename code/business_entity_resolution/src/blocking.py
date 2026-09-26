@@ -94,6 +94,17 @@ def extract_name_keys(name):
         keys.append(f"w_last:{clean_words[-1]}")
         keys.append(f"w2:{clean_words[0]}_{clean_words[1]}")
         
+    # Longest word key
+    longest = max(clean_words, key=len)
+    if len(longest) >= 5:
+        keys.append(f"wl:{longest}")
+        
+    # Acronym key
+    if len(clean_words) >= 2:
+        acronym = "".join(w[0] for w in clean_words[:5]) # limit to 5 letters
+        if len(acronym) >= 2:
+            keys.append(f"acr:{acronym}")
+            
     return keys
 
 def extract_addr_keys(addr):
@@ -106,6 +117,9 @@ def extract_addr_keys(addr):
     words = [t for t in tokens if not t.isdigit() and len(t) >= 4 and t not in ADDR_STOPWORDS]
     
     keys = []
+    if numbers:
+        keys.append(f"num:{numbers[0]}")
+        
     if numbers and words:
         for w in words[:2]:
             keys.append(f"num_w:{numbers[0]}_{w}")

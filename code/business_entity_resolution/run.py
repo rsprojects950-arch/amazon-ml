@@ -15,6 +15,7 @@ import pandas as pd
 import duckdb
 import joblib
 import re
+from sklearn.model_selection import train_test_split
 
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,7 +31,49 @@ from src.pipeline import (
     preprocess_target_records, build_inverted_index, worker_process_s1_batch, init_worker
 )
 
-def train_matching_model(train_dir, model_save_path, sample_size=30000, num_workers=8):
+def compute_f05_score(val_df, val_pairs, probs, threshold, gt_map):
+    scored_pairs = []
+    for (s1_id, tid), prob in zip(val_pairs, probs):
+        if prob >= threshold:
+            scored_pairs.append((prob, s1_id, tid))
+            
+    scored_pairs.sort(key=lambda x: x[0], reverse=True)
+    assigned_targets = set()
+    pred_map = defaultdict(set)
+    for prob, s1_id, tid in scored_pairs:
+        if tid not in assigned_targets:
+            assigned_targets.add(tid)
+            pred_map[s1_id].add(tid)
+            
+    f05_scores = []
+    for s1_id in val_df['entity_id']:
+        preds = pred_map.get(s1_id, set())
+        trues = gt_map.get(s1_id, set())
+        
+        if not trues:
+            if not preds:
+                f05_scores.append(1.0)
+            else:
+                f05_scores.append(0.0)
+            continue
+            
+        tp = len(preds & trues)
+        fp = len(preds - trues)
+        fn = len(trues - preds)
+        
+        if tp == 0:
+            f05_scores.append(0.0)
+            continue
+            
+        precision = tp / (tp + fp)
+        recall = tp / (tp + fn)
+        
+        f05 = (1.25 * precision * recall) / (0.25 * precision + recall)
+        f05_scores.append(f05)
+        
+    return np.mean(f05_scores)
+
+def train_matching_model(train_dir, model_save_path, sample_size=200000, num_workers=8):
     """
     Trains the LightGBM matching model on a representative sample of ground truth data.
     """
@@ -83,6 +126,7 @@ def train_matching_model(train_dir, model_save_path, sample_size=30000, num_work
         WHERE matched_entity_ids IS NOT NULL AND length(trim(matched_entity_ids)) > 0
     """)
     
+    # Increase negative sampling significantly to 500k each
     targets_train = con.execute(f"""
         SELECT entity_id, business_name, business_address, country 
         FROM read_csv('{s2_path}', delim='\\t', header=True)
@@ -95,13 +139,13 @@ def train_matching_model(train_dir, model_save_path, sample_size=30000, num_work
         SELECT * FROM (
             SELECT entity_id, business_name, business_address, country 
             FROM read_csv('{s2_path}', delim='\\t', header=True)
-            LIMIT 50000
+            LIMIT 500000
         )
         UNION ALL
         SELECT * FROM (
             SELECT entity_id, business_name, business_address, country 
             FROM read_csv('{s3_path}', delim='\\t', header=True)
-            LIMIT 50000
+            LIMIT 500000
         )
     """).fetchdf().drop_duplicates(subset=['entity_id'])
     
@@ -118,61 +162,101 @@ def train_matching_model(train_dir, model_save_path, sample_size=30000, num_work
             if len(idx) < cap:
                 idx.append(tid)
                 
-    # Prepare training feature rows
-    X_train_list, y_train_list = [], []
-    for s1_row in s1_train_df.itertuples(index=False):
-        s1_id = s1_row.entity_id
-        country = s1_row.country
-        s1_name = str(s1_row.business_name) if pd.notna(s1_row.business_name) else ""
-        s1_addr = str(s1_row.business_address) if pd.notna(s1_row.business_address) else ""
-        s1_clean = clean_business_name(s1_name)
-        s1_nm_words = set(s1_clean.split())
-        s1_ad_words = set(w for w in clean_text(s1_addr).split() if len(w) >= 3 and w not in ADDR_STOPWORDS)
-        s1_nums = set(re.findall(r'\b\d+\b', s1_addr))
-        s1_tuple = (s1_name, s1_addr, s1_clean, s1_nm_words, s1_ad_words, s1_nums)
-        
-        country_idx = inv_index[country]
-        s1_keys = extract_name_keys(s1_name) + extract_addr_keys(s1_addr) + extract_combined_keys(s1_name, s1_addr)
-        hit_counts = defaultdict(int)
-        for k in set(s1_keys):
-            if k in country_idx:
-                wt = 3 if (k.startswith("cn:") or k.startswith("dom:")) else 1
-                for tid in country_idx[k]:
-                    hit_counts[tid] += wt
-                    
-        if not hit_counts:
-            continue
-        cands = sorted(hit_counts.keys(), key=lambda x: hit_counts[x], reverse=True)[:35]
-        
-        feats = []
-        for tid in cands:
-            t_data = target_records[tid]
-            target_tuple = (t_data[0], t_data[1], t_data[2], t_data[3], t_data[4], t_data[5])
-            hits = hit_counts[tid]
-            is_s2 = 1.0 if tid.startswith('S2-') else 0.0
-            feat = extract_pair_features(s1_tuple, target_tuple, hits, is_s2)
-            feats.append(feat)
-            
-        true_set = gt_map.get(s1_id, set())
-        labels = [1 if tid in true_set else 0 for tid in cands]
-        
-        X_train_list.append(np.array(feats, dtype=np.float32))
-        y_train_list.append(np.array(labels, dtype=np.int32))
-        
-    X_train = np.vstack(X_train_list)
-    y_train = np.concatenate(y_train_list)
-    print(f"  Training feature matrix: {X_train.shape} with {int(y_train.sum())} positive pairs ({y_train.mean()*100:.2f}%)")
+    # Split S1 into 80% train, 20% validation
+    train_df, val_df = train_test_split(s1_train_df, test_size=0.2, random_state=42)
     
-    clf = train_lgbm_model(X_train, y_train, save_path=model_save_path)
-    con.close()
-    print(f"  Training completed in {time.time()-t0:.2f}s")
-    return clf
+    def extract_features_for_df(df):
+        X_list, y_list, pair_list = [], [], []
+        for s1_row in df.itertuples(index=False):
+            s1_id = s1_row.entity_id
+            country = s1_row.country
+            s1_name = str(s1_row.business_name) if pd.notna(s1_row.business_name) else ""
+            s1_addr = str(s1_row.business_address) if pd.notna(s1_row.business_address) else ""
+            s1_clean = clean_business_name(s1_name)
+            s1_nm_words = set(s1_clean.split())
+            s1_ad_words = set(w for w in clean_text(s1_addr).split() if len(w) >= 3 and w not in ADDR_STOPWORDS)
+            s1_nums = set(re.findall(r'\b\d+\b', s1_addr))
+            s1_tuple = (s1_name, s1_addr, s1_clean, s1_nm_words, s1_ad_words, s1_nums)
+            
+            country_idx = inv_index[country]
+            s1_keys = extract_name_keys(s1_name) + extract_addr_keys(s1_addr) + extract_combined_keys(s1_name, s1_addr)
+            hit_counts = defaultdict(int)
+            for k in set(s1_keys):
+                if k in country_idx:
+                    wt = 3 if (k.startswith("cn:") or k.startswith("dom:")) else 1
+                    for tid in country_idx[k]:
+                        hit_counts[tid] += wt
+                        
+            if not hit_counts:
+                continue
+                
+            sorted_all = sorted(hit_counts.keys(), key=lambda x: hit_counts[x], reverse=True)
+            top_hit = hit_counts[sorted_all[0]]
+            
+            # No dynamic cutoff to preserve 1-hit true matches
+            cands = sorted_all[:80]
+            
+            feats = []
+            for rank, tid in enumerate(cands):
+                t_data = target_records[tid]
+                target_tuple = (t_data[0], t_data[1], t_data[2], t_data[3], t_data[4], t_data[5])
+                hits = hit_counts[tid]
+                is_s2 = 1.0 if tid.startswith('S2-') else 0.0
+                feat = extract_pair_features(s1_tuple, target_tuple, hits, is_s2, rank)
+                feats.append(feat)
+                
+            true_set = gt_map.get(s1_id, set())
+            labels = [1 if tid in true_set else 0 for tid in cands]
+            
+            if feats:
+                X_list.append(np.array(feats, dtype=np.float32))
+                y_list.append(np.array(labels, dtype=np.int32))
+                pair_list.extend([(s1_id, tid) for tid in cands])
+            
+        X = np.vstack(X_list) if X_list else np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
+        y = np.concatenate(y_list) if y_list else np.empty((0,), dtype=np.int32)
+        return X, y, pair_list
 
-def run_test_inference(test_dir, output_dir, model_path, threshold=0.58, max_cands=35, num_workers=10):
+    print("  Extracting features for training set...")
+    X_train, y_train, _ = extract_features_for_df(train_df)
+    print(f"  Training feature matrix: {X_train.shape} with {int(y_train.sum())} positive pairs")
+    
+    print("  Extracting features for validation set...")
+    X_val, y_val, val_pairs = extract_features_for_df(val_df)
+    
+    print("  Training initial model on 80% split...")
+    clf = train_lgbm_model(X_train, y_train, save_path=None)
+    
+    print("  Predicting on validation set & Tuning Threshold...")
+    probs = clf.predict_proba(X_val)[:, 1]
+    
+    best_threshold = 0.58
+    best_f05 = -1.0
+    thresholds_to_test = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+    
+    for t in thresholds_to_test:
+        f05 = compute_f05_score(val_df, val_pairs, probs, t, gt_map)
+        print(f"    Threshold: {t:.2f} -> F0.5 = {f05:.4f}")
+        if f05 > best_f05:
+            best_f05 = f05
+            best_threshold = t
+            
+    print(f"  Best Threshold Found: {best_threshold:.2f} (F0.5 = {best_f05:.4f})")
+    
+    print("  Retraining model on full dataset (Train + Val)...")
+    X_full = np.vstack([X_train, X_val]) if X_val.shape[0] > 0 else X_train
+    y_full = np.concatenate([y_train, y_val]) if y_val.shape[0] > 0 else y_train
+    clf = train_lgbm_model(X_full, y_full, save_path=model_save_path)
+    
+    con.close()
+    print(f"  Training stage completed in {time.time()-t0:.2f}s")
+    return clf, best_threshold
+
+def run_test_inference(test_dir, output_dir, model_path, threshold=0.58, max_cands=80, num_workers=10):
     """
     Executes inference over test_source1, test_source2, and test_source3 partitioned by country.
     """
-    print("\n[Inference Stage] Starting country-partitioned inference...")
+    print(f"\n[Inference Stage] Starting country-partitioned inference with threshold {threshold:.2f}...")
     t_start = time.time()
     
     os.makedirs(output_dir, exist_ok=True)
@@ -270,15 +354,18 @@ def run_test_inference(test_dir, output_dir, model_path, threshold=0.58, max_can
                     country_candidate_map[s1_id] = []
                     continue
                     
-                cands = sorted(hit_counts.keys(), key=lambda x: hit_counts[x], reverse=True)[:max_cands]
+                sorted_all = sorted(hit_counts.keys(), key=lambda x: hit_counts[x], reverse=True)
+                top_hit = hit_counts[sorted_all[0]]
+                
+                cands = sorted_all[:max_cands]
                 country_candidate_map[s1_id] = cands
                 
-                for tid in cands:
+                for rank, tid in enumerate(cands):
                     t_data = target_records[tid]
                     target_tuple = (t_data[0], t_data[1], t_data[2], t_data[3], t_data[4], t_data[5])
                     hits = hit_counts[tid]
                     is_s2 = 1.0 if tid.startswith('S2-') else 0.0
-                    feat = extract_pair_features(s1_tuple, target_tuple, hits, is_s2)
+                    feat = extract_pair_features(s1_tuple, target_tuple, hits, is_s2, rank)
                     chunk_pair_tuples.append((s1_id, tid))
                     chunk_feat_rows.append(feat)
                     
@@ -342,24 +429,27 @@ def main():
     parser.add_argument("--test-dir", default="../../dataset/test", help="Path to test data directory")
     parser.add_argument("--output-dir", default="../../output", help="Path to output directory")
     parser.add_argument("--model-path", default="models/lgb_matcher.joblib", help="Path to save/load trained model")
-    parser.add_argument("--threshold", type=float, default=0.58, help="Probability threshold for matching")
-    parser.add_argument("--max-cands", type=int, default=35, help="Max candidates per S1 entity")
+    parser.add_argument("--threshold", type=float, default=0.58, help="Fallback probability threshold for matching")
+    parser.add_argument("--max-cands", type=int, default=80, help="Max candidates per S1 entity")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of parallel worker processes")
     parser.add_argument("--skip-train", action="store_true", help="Skip training if model file exists")
     args = parser.parse_args()
     
-    # 1. Train model if needed
+    # 1. Train model and tune threshold if needed
     if not args.skip_train or not os.path.exists(args.model_path):
-        train_matching_model(args.train_dir, args.model_path, sample_size=40000, num_workers=args.num_workers)
+        clf, best_threshold = train_matching_model(args.train_dir, args.model_path, sample_size=200000, num_workers=args.num_workers)
     else:
         print(f"Found existing model at {args.model_path}, skipping training.")
+        best_threshold = args.threshold
+        
+    print(f"Validation suggested threshold: {best_threshold}. Proceeding with this threshold.")
         
     # 2. Run inference on test data
     run_test_inference(
         test_dir=args.test_dir,
         output_dir=args.output_dir,
         model_path=args.model_path,
-        threshold=args.threshold,
+        threshold=best_threshold,
         max_cands=args.max_cands,
         num_workers=args.num_workers
     )

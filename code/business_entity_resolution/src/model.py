@@ -13,14 +13,15 @@ def train_lgbm_model(X_train, y_train, save_path=None):
     Trains a LightGBM Binary Classifier on entity pair features.
     """
     clf = lgb.LGBMClassifier(
-        n_estimators=350,
-        learning_rate=0.04,
-        num_leaves=31,
+        n_estimators=1200,
+        learning_rate=0.03,
+        num_leaves=127,
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
         n_jobs=8,
-        verbose=-1
+        verbose=-1,
+        is_unbalance=True
     )
     clf.fit(X_train, y_train, feature_name=FEATURE_NAMES)
     
